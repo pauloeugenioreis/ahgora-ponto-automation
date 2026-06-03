@@ -1,10 +1,80 @@
 const puppeteer = require('puppeteer');
 const { authenticator } = require('otplib');
+const fs = require('fs');
+const path = require('path');
 const config = require('./config');
 const logger = require('./logger');
 const { notifySuccess, notifyError, sendTelegram } = require('./notify');
 const { checkTelegramAndProcess } = require('./bot');
 const { runMonthlyLogCleanup } = require('./log-cleanup');
+
+// ---------------------------------------------------------------------------
+// Sessão persistente
+// ---------------------------------------------------------------------------
+
+const SESSION_FILE = path.join(__dirname, '..', 'session', 'cookies.json');
+
+async function saveCookies(page) {
+  try {
+    fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
+    // Pega todos os cookies de todos os domínios visitados
+    const client = await page.createCDPSession();
+    const { cookies } = await client.send('Network.getAllCookies');
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(cookies, null, 2), 'utf8');
+    logger.info(`Sessão salva: ${cookies.length} cookies`);
+  } catch (err) {
+    logger.warn(`Falha ao salvar sessão: ${err.message}`);
+  }
+}
+
+async function loadCookies(page) {
+  if (!fs.existsSync(SESSION_FILE)) return false;
+  try {
+    const cookies = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+    if (!cookies.length) return false;
+    await page.setCookie(...cookies);
+    logger.info(`Sessão carregada: ${cookies.length} cookies`);
+    return true;
+  } catch (err) {
+    logger.warn(`Falha ao carregar sessão: ${err.message}`);
+    return false;
+  }
+}
+
+async function isSessionValid(page) {
+  logger.info('Verificando validade da sessão...');
+  try {
+    await page.goto(config.pontoUrl, { waitUntil: 'networkidle2', timeout: config.timeout });
+    await sleep(3000);
+    const url = page.url();
+    logger.info(`URL após carregar sessão: ${url}`);
+
+    const expired = (
+      url.includes('microsoftonline.com') ||
+      url.includes('login.microsoft.com') ||
+      url.includes('/login') ||
+      url.includes('/signin')
+    );
+
+    if (expired) {
+      logger.info('Sessão expirada — redirecionou para login');
+      return false;
+    }
+
+    logger.info('Sessão válida!');
+    return true;
+  } catch (err) {
+    logger.warn(`Erro ao verificar sessão: ${err.message}`);
+    return false;
+  }
+}
+
+function deleteSession() {
+  if (fs.existsSync(SESSION_FILE)) {
+    fs.unlinkSync(SESSION_FILE);
+    logger.info('Arquivo de sessão removido');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -20,9 +90,9 @@ async function debugScreenshot(page, name) {
   if (!config.debug) return;
   try {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const path = `logs/debug-${name}-${ts}.png`;
-    await page.screenshot({ path, fullPage: true });
-    logger.info(`Screenshot salva: ${path}`);
+    const filePath = `logs/debug-${name}-${ts}.png`;
+    await page.screenshot({ path: filePath, fullPage: true });
+    logger.info(`Screenshot salva: ${filePath}`);
   } catch (err) {
     logger.warn(`Screenshot falhou (${name}): ${err.message}`);
   }
@@ -49,9 +119,7 @@ function getBatidaAtual() {
 }
 
 // ---------------------------------------------------------------------------
-// Etapa 1 — Login Ahgora → SSO Microsoft (Azure AD)
-//   Ahgora (e-mail → botão Microsoft) → login.microsoftonline.com
-//   → senha Microsoft → MFA → redireciona de volta ao Ahgora
+// Login Ahgora → SSO Microsoft
 // ---------------------------------------------------------------------------
 
 async function login(page) {
@@ -62,28 +130,20 @@ async function login(page) {
   const currentUrl = page.url();
   logger.info(`URL após navegação: ${currentUrl}`);
 
-  // Se já redirecionou direto para Microsoft SSO
   if (currentUrl.includes('microsoftonline.com') || currentUrl.includes('login.microsoft.com')) {
     logger.info('Redirecionado diretamente para Microsoft SSO');
     await handleMicrosoftSSO(page);
     return;
   }
 
-  // Tenta login via e-mail no Ahgora (campo de e-mail → submeter → botão Microsoft)
   await handleAhgoraLogin(page);
-
   await debugScreenshot(page, '06-login-complete');
 }
-
-// ---------------------------------------------------------------------------
-// Login Ahgora — preenche e-mail e aciona SSO Microsoft
-// ---------------------------------------------------------------------------
 
 async function handleAhgoraLogin(page) {
   logger.info('Tentando login no Ahgora...');
   await debugScreenshot(page, '02-ahgora-login');
 
-  // Estratégia 1: Campo de e-mail + botão de submit/next
   const emailSelectors = [
     'input[type="email"]',
     'input[name="email"]',
@@ -112,7 +172,6 @@ async function handleAhgoraLogin(page) {
     logger.info(`E-mail preenchido: ${config.user}`);
     await debugScreenshot(page, '03-email-filled');
 
-    // Tenta clicar em botão de próximo/submit
     const nextSelectors = [
       'button[type="submit"]',
       'input[type="submit"]',
@@ -132,7 +191,6 @@ async function handleAhgoraLogin(page) {
             await btn.click();
             logger.info(`Botão de submit clicado: ${sel}`);
             await sleep(2000);
-            await debugScreenshot(page, '04-after-submit');
             break;
           }
         }
@@ -140,20 +198,14 @@ async function handleAhgoraLogin(page) {
     }
   }
 
-  // Estratégia 2: Botão "Entrar com Microsoft" / "Login com Microsoft"
+  // Botão "Entrar com Microsoft"
   await sleep(1500);
   const msButtonResult = await page.evaluate(() => {
     const candidates = document.querySelectorAll('button, a, [role="button"]');
     for (const el of candidates) {
       const text = el.textContent.trim().toLowerCase();
-      if (
-        text.includes('microsoft') ||
-        text.includes('azure') ||
-        text.includes('office 365') ||
-        text.includes('sso')
-      ) {
-        const visible = el.offsetParent !== null;
-        if (visible) {
+      if (text.includes('microsoft') || text.includes('azure') || text.includes('sso')) {
+        if (el.offsetParent !== null) {
           el.click();
           return el.textContent.trim();
         }
@@ -164,12 +216,9 @@ async function handleAhgoraLogin(page) {
 
   if (msButtonResult) {
     logger.info(`Botão Microsoft clicado: "${msButtonResult}"`);
-  } else {
-    logger.info('Botão Microsoft não encontrado — aguardando redirecionamento automático');
   }
 
   await sleep(3000);
-  await debugScreenshot(page, '05-before-sso');
 
   const urlAfter = page.url();
   logger.info(`URL após tentativa de login: ${urlAfter}`);
@@ -177,7 +226,6 @@ async function handleAhgoraLogin(page) {
   if (urlAfter.includes('microsoftonline.com') || urlAfter.includes('login.microsoft.com')) {
     await handleMicrosoftSSO(page);
   } else {
-    // Aguarda navegação para Microsoft (pode ser redirect via JS)
     try {
       await page.waitForFunction(
         () => window.location.href.includes('microsoftonline.com') ||
@@ -186,32 +234,29 @@ async function handleAhgoraLogin(page) {
       );
       await handleMicrosoftSSO(page);
     } catch {
-      logger.warn('Não redirecionou para Microsoft SSO — verificando estado atual');
+      logger.warn('Não redirecionou para Microsoft SSO');
       await debugScreenshot(page, '05-sso-timeout');
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// SSO Microsoft — Senha + MFA
+// SSO Microsoft — Senha + Push MFA
 // ---------------------------------------------------------------------------
 
 async function handleMicrosoftSSO(page) {
   logger.info('Entrando no fluxo SSO Microsoft...');
 
-  // Microsoft pode pedir o e-mail novamente
   const msEmailField = await page.$('input[type="email"], input[name="loginfmt"]');
   if (msEmailField) {
     const needsEmail = await page.evaluate((el) => el.offsetParent !== null, msEmailField);
     if (needsEmail) {
-      logger.info('Microsoft pediu e-mail novamente, preenchendo...');
+      logger.info('Microsoft pediu e-mail, preenchendo...');
       await msEmailField.click({ clickCount: 3 });
       await msEmailField.type(config.user, { delay: 30 });
-
       const nextBtn = await page.$('input[type="submit"], #idSIButton9');
       if (nextBtn) {
         await nextBtn.click();
-        logger.info('Botão "Next" Microsoft clicado');
         await sleep(2000);
       }
     }
@@ -219,24 +264,22 @@ async function handleMicrosoftSSO(page) {
 
   await debugScreenshot(page, '04-ms-email');
 
-  // Campo de senha Microsoft
   logger.info('Aguardando campo de senha Microsoft...');
   const passSelector = 'input[type="password"], input[name="passwd"], #i0118';
   await page.waitForSelector(passSelector, { visible: true, timeout: config.timeout });
   const passField = await page.$(passSelector);
   await passField.type(config.password, { delay: 30 });
-  logger.info('Senha Microsoft preenchida');
-  await debugScreenshot(page, '04-ms-password-filled');
+  logger.info('Senha preenchida');
 
   const signInBtn = await page.$('input[type="submit"], #idSIButton9');
   if (signInBtn) {
     await signInBtn.click();
-    logger.info('Botão "Sign in" Microsoft clicado');
+    logger.info('Botão "Sign in" clicado');
   }
   await sleep(3000);
   await debugScreenshot(page, '05-ms-after-signin');
 
-  await handleMicrosoftMFA(page);
+  await handleMFA(page);
   await handleStaySignedIn(page);
 
   logger.info('Aguardando redirecionamento de volta ao Ahgora...');
@@ -247,22 +290,16 @@ async function handleMicrosoftSSO(page) {
     );
     logger.info('Redirecionado para o Ahgora com sucesso!');
   } catch {
-    logger.warn('Timeout aguardando redirecionamento ao Ahgora — pode já estar na página');
+    logger.warn('Timeout aguardando redirecionamento ao Ahgora');
   }
   await sleep(3000);
 }
 
 // ---------------------------------------------------------------------------
-// MFA Microsoft (TOTP)
+// MFA — tenta TOTP se configurado, senão aguarda push do usuário
 // ---------------------------------------------------------------------------
 
-async function handleMicrosoftMFA(page) {
-  if (!config.mfaSecret) {
-    logger.info('MFA_SECRET não configurado — pulando MFA');
-    return;
-  }
-
-  logger.info('Verificando se há tela de MFA Microsoft...');
+async function handleMFA(page) {
   await sleep(3000);
 
   const currentUrl = page.url();
@@ -273,20 +310,75 @@ async function handleMicrosoftMFA(page) {
 
   await debugScreenshot(page, '05-ms-mfa-page');
 
+  // Se tiver TOTP configurado, tenta usá-lo
+  if (config.mfaSecret) {
+    logger.info('TOTP configurado — tentando MFA por código');
+    await handleMicrosoftMFA(page);
+    return;
+  }
+
+  // Sem TOTP: aguarda aprovação do push pelo usuário
+  await handlePushMFA(page);
+}
+
+async function handlePushMFA(page) {
+  logger.info('Aguardando aprovação do push MFA pelo usuário...');
+  const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
+  await sendTelegram(
+    `${prefix}🔐 <b>Aprovação de login necessária!</b>\n\n` +
+    `Abra o <b>Microsoft Authenticator</b> no celular e aprove a notificação de login.\n\n` +
+    `⏱ Aguardando até 2 minutos...`
+  );
+
+  // Aguarda até 2 minutos para o usuário aprovar o push
+  const PUSH_TIMEOUT = 120_000;
+  const start = Date.now();
+
+  while (Date.now() - start < PUSH_TIMEOUT) {
+    const url = page.url();
+    if (!url.includes('microsoftonline.com') && !url.includes('login.microsoft.com')) {
+      logger.info('Push aprovado! Redirecionou para fora da Microsoft.');
+      return;
+    }
+
+    // Detecta se a tela atual é a de push (número de aprovação) e aguarda
+    const isOnPushScreen = await page.evaluate(() => {
+      const text = document.body?.innerText?.toLowerCase() || '';
+      return (
+        text.includes('approve') ||
+        text.includes('aprovar') ||
+        text.includes('authenticator') ||
+        text.includes('notification')
+      );
+    }).catch(() => false);
+
+    if (isOnPushScreen) {
+      logger.info(`Aguardando aprovação do push... (${Math.round((Date.now() - start) / 1000)}s)`);
+    }
+
+    await sleep(3000);
+  }
+
+  // Timeout: verifica se já foi redirecionado mesmo assim
+  const finalUrl = page.url();
+  if (!finalUrl.includes('microsoftonline.com') && !finalUrl.includes('login.microsoft.com')) {
+    logger.info('Push aprovado após timeout de verificação');
+    return;
+  }
+
+  throw new Error('Timeout aguardando aprovação do push MFA (2 minutos)');
+}
+
+async function handleMicrosoftMFA(page) {
   let foundCodeField = false;
 
   for (let attempt = 1; attempt <= 3 && !foundCodeField; attempt++) {
-    logger.info(`Tentativa ${attempt} de chegar ao campo de código TOTP...`);
-    await debugScreenshot(page, `05-ms-mfa-attempt-${attempt}`);
+    logger.info(`Tentativa ${attempt} de chegar ao campo TOTP...`);
 
     const codeField = await page.$('#idTxtBx_SAOTCC_OTC');
     if (codeField) {
       const visible = await page.evaluate((el) => el.offsetParent !== null, codeField);
-      if (visible) {
-        logger.info('Campo de código TOTP já visível!');
-        foundCodeField = true;
-        break;
-      }
+      if (visible) { foundCodeField = true; break; }
     }
 
     const signInAnotherWay = await page.$('#signInAnotherWay');
@@ -294,7 +386,7 @@ async function handleMicrosoftMFA(page) {
       const visible = await page.evaluate((el) => el.offsetParent !== null, signInAnotherWay);
       if (visible) {
         await page.evaluate((el) => el.click(), signInAnotherWay);
-        logger.info('Clicou em "I can\'t use my Microsoft Authenticator app right now"');
+        logger.info('Clicou em "Não consigo usar meu Authenticator"');
         await sleep(3000);
         continue;
       }
@@ -305,7 +397,7 @@ async function handleMicrosoftMFA(page) {
       const visible = await page.evaluate((el) => el.offsetParent !== null, phoneAppOTP);
       if (visible) {
         await page.evaluate((el) => el.click(), phoneAppOTP);
-        logger.info('Clicou em PhoneAppOTP via data-value');
+        logger.info('Clicou em PhoneAppOTP');
         await sleep(3000);
         continue;
       }
@@ -314,15 +406,12 @@ async function handleMicrosoftMFA(page) {
     await sleep(2000);
   }
 
-  await debugScreenshot(page, '05-ms-after-use-code');
-
   const mfaSelectors = [
     '#idTxtBx_SAOTCC_OTC',
     'input[name="otc"]',
     'input[aria-label*="code"]',
     'input[aria-label*="código"]',
     'input[placeholder*="Code"]',
-    'input[placeholder*="code"]',
     'input[type="tel"]',
   ];
 
@@ -333,18 +422,15 @@ async function handleMicrosoftMFA(page) {
       mfaField = await page.$(sel);
       if (mfaField) {
         const visible = await page.evaluate((el) => el.offsetParent !== null, mfaField);
-        if (visible) {
-          mfaSel = sel;
-          break;
-        }
+        if (visible) { mfaSel = sel; break; }
         mfaField = null;
       }
     } catch { /* ignora */ }
   }
 
   if (!mfaField) {
-    logger.error('Campo de código MFA não encontrado');
-    await debugScreenshot(page, '05-ms-mfa-field-not-found');
+    logger.error('Campo de código MFA não encontrado — caindo para push');
+    await handlePushMFA(page);
     return;
   }
 
@@ -354,7 +440,6 @@ async function handleMicrosoftMFA(page) {
 
   await mfaField.click();
   await mfaField.type(token, { delay: 50 });
-  await debugScreenshot(page, '05-ms-mfa-filled');
 
   const verifySelectors = [
     '#idSubmit_SAOTCC_Continue',
@@ -378,7 +463,6 @@ async function handleMicrosoftMFA(page) {
   }
 
   await sleep(3000);
-  await debugScreenshot(page, '05-ms-after-mfa');
 }
 
 // ---------------------------------------------------------------------------
@@ -398,16 +482,15 @@ async function handleStaySignedIn(page) {
         logger.info(`Tela "Permanecer conectado?" — clicando "${text.trim()}" (${sel})`);
         await page.evaluate((el) => el.click(), btn);
         await sleep(5000);
-        await debugScreenshot(page, '05-ms-stay-signed');
         return;
       }
     }
   }
-  logger.info('Tela "Permanecer conectado?" não detectada, seguindo...');
+  logger.info('Tela "Permanecer conectado?" não detectada');
 }
 
 // ---------------------------------------------------------------------------
-// Etapa 2 — Registrar ponto no Ahgora
+// Registrar ponto no Ahgora
 // ---------------------------------------------------------------------------
 
 async function registrarPonto(page) {
@@ -416,11 +499,14 @@ async function registrarPonto(page) {
   await sleep(5000);
   await debugScreenshot(page, '08-ponto-page');
 
-  logger.info(`URL atual: ${page.url()}`);
-  const pageTitle = await page.title();
-  logger.info(`Título da página: ${pageTitle}`);
+  const currentUrl = page.url();
+  logger.info(`URL atual: ${currentUrl}`);
 
-  // Registra listener de API antes do clique
+  // Se redirecionou para login, sessão expirou durante navegação
+  if (currentUrl.includes('microsoftonline.com') || currentUrl.includes('/login')) {
+    throw new Error('Sessão expirou ao navegar para página de ponto');
+  }
+
   const apiResponsePromise = page
     .waitForResponse(
       (res) => {
@@ -463,20 +549,11 @@ async function registrarPonto(page) {
     // 2. Seletores específicos do Ahgora
     async (ctx) => {
       const selectors = [
-        '.batida-btn',
-        '.btn-batida',
-        '.punch-button',
-        '.register-button',
-        '[class*="batida"]',
-        '[class*="punch"]',
-        '[class*="bater"]',
-        '[data-testid*="batida"]',
-        '[data-testid*="punch"]',
-        'button.primary',
-        'button.mat-raised-button',
-        'button.mat-flat-button',
-        '.fab-button',
-        'ion-button',
+        '.batida-btn', '.btn-batida', '.punch-button', '.register-button',
+        '[class*="batida"]', '[class*="punch"]', '[class*="bater"]',
+        '[data-testid*="batida"]', '[data-testid*="punch"]',
+        'button.primary', 'button.mat-raised-button', 'button.mat-flat-button',
+        '.fab-button', 'ion-button',
       ];
       for (const sel of selectors) {
         try {
@@ -494,16 +571,15 @@ async function registrarPonto(page) {
       return false;
     },
 
-    // 3. Qualquer elemento visível com texto de ponto
+    // 3. Evaluate geral
     async (ctx) => {
       const result = await ctx.evaluate(() => {
-        const allElements = document.querySelectorAll(
-          'button, a, span, div, [role="button"], ion-button, mat-button'
-        );
-        for (const el of allElements) {
+        const all = document.querySelectorAll('button, a, span, div, [role="button"], ion-button');
+        for (const el of all) {
           const text = el.textContent.trim().toLowerCase();
           if (
-            (text.includes('bater') || text.includes('registrar ponto') || text.includes('marcar ponto') || text === 'ponto') &&
+            (text.includes('bater') || text.includes('registrar ponto') ||
+             text.includes('marcar ponto') || text === 'ponto') &&
             el.offsetParent !== null
           ) {
             el.click();
@@ -520,12 +596,8 @@ async function registrarPonto(page) {
     },
   ];
 
-  // Tenta em todos os frames (página + iframes)
   const frames = [page, ...page.frames().filter(f => f !== page.mainFrame())];
   logger.info(`Frames encontrados: ${frames.length}`);
-  for (const frame of frames) {
-    if (frame !== page) logger.info(`  Frame: ${frame.url()}`);
-  }
 
   for (const target of frames) {
     const targetName = target === page ? 'página principal' : target.url();
@@ -535,7 +607,7 @@ async function registrarPonto(page) {
       try {
         const ok = await estrategia(target);
         if (ok) {
-          logger.info('Clique realizado — aguardando resposta da API do Ahgora...');
+          logger.info('Clique realizado — aguardando resposta da API...');
           const apiResponse = await apiResponsePromise;
 
           if (apiResponse) {
@@ -549,40 +621,36 @@ async function registrarPonto(page) {
               await debugScreenshot(page, '09-ponto-registrado');
               return true;
             }
-            logger.warn(`API retornou status ${status} — ponto não confirmado`);
+            logger.warn(`API retornou status ${status}`);
             await debugScreenshot(page, '09-ponto-api-falhou');
             return false;
           }
 
-          // Fallback: verifica confirmação visual
-          logger.warn('Timeout aguardando resposta da API — verificando confirmação visual...');
+          // Fallback: confirmação visual
+          logger.warn('Timeout na API — verificando confirmação visual...');
           const confirmFn = () => {
-            const text = (document.body?.innerText || document.body?.textContent || '').toLowerCase();
+            const text = (document.body?.innerText || '').toLowerCase();
             return (
-              text.includes('batida registrada') ||
-              text.includes('ponto registrado') ||
-              text.includes('registrado com sucesso') ||
-              text.includes('batida realizada') ||
-              text.includes('marcação realizada') ||
-              text.includes('batida confirmada')
+              text.includes('batida registrada') || text.includes('ponto registrado') ||
+              text.includes('registrado com sucesso') || text.includes('batida realizada') ||
+              text.includes('marcação realizada') || text.includes('batida confirmada')
             );
           };
 
-          const frameChecks = page.frames().map((frame) => {
-            const label = frame === page.mainFrame() ? 'página principal' : frame.url();
-            return frame.waitForFunction(confirmFn, { timeout: 10_000 })
-              .then(() => { logger.info(`Confirmação visual em: ${label}`); return true; })
-              .catch(() => false);
-          });
+          const checks = page.frames().map((f) =>
+            f.waitForFunction(confirmFn, { timeout: 10_000 })
+              .then(() => { logger.info(`Confirmação visual em: ${f === page.mainFrame() ? 'principal' : f.url()}`); return true; })
+              .catch(() => false)
+          );
 
-          const visualConfirmed = (await Promise.all(frameChecks)).some(Boolean);
-          if (!visualConfirmed) {
-            logger.warn('Confirmação não detectada — ponto não confirmado');
-            await debugScreenshot(page, '09-ponto-nao-confirmado');
-            return false;
+          if ((await Promise.all(checks)).some(Boolean)) {
+            await debugScreenshot(page, '09-ponto-registrado');
+            return true;
           }
-          await debugScreenshot(page, '09-ponto-registrado');
-          return true;
+
+          logger.warn('Confirmação não detectada');
+          await debugScreenshot(page, '09-ponto-nao-confirmado');
+          return false;
         }
       } catch (err) {
         logger.warn(`Estratégia falhou em ${targetName}: ${err.message}`);
@@ -590,29 +658,19 @@ async function registrarPonto(page) {
     }
   }
 
-  // Diagnóstico: loga HTML para ajudar a mapear seletores
+  // Diagnóstico
   try {
     const html = await page.evaluate(() => document.body.innerHTML.substring(0, 5000));
-    logger.info(`HTML da página (primeiros 5000 chars):\n${html}`);
-    for (const frame of page.frames()) {
-      if (frame !== page.mainFrame()) {
-        try {
-          const fHtml = await frame.evaluate(() => document.body.innerHTML.substring(0, 3000));
-          logger.info(`HTML do iframe (${frame.url()}):\n${fHtml}`);
-        } catch { /* ignore */ }
-      }
-    }
-  } catch (e) {
-    logger.warn(`Não foi possível capturar HTML: ${e.message}`);
-  }
+    logger.info(`HTML da página:\n${html}`);
+  } catch { /* ignora */ }
 
   await debugScreenshot(page, '09-ponto-NAO-encontrado');
-  logger.error('Não foi possível encontrar o botão de registrar ponto. Use DRY_RUN=true + DEBUG=true para inspecionar a página.');
+  logger.error('Botão de registrar ponto não encontrado. Use DRY_RUN=true DEBUG=true para inspecionar.');
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// Executa o fluxo completo (login → ponto)
+// Fluxo principal com gestão de sessão
 // ---------------------------------------------------------------------------
 
 async function executar() {
@@ -636,34 +694,53 @@ async function executar() {
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   );
 
-  // Geolocalização para o Ahgora aceitar a batida
   const context = browser.defaultBrowserContext();
   await context.overridePermissions('https://app.ahgora.com.br', ['geolocation']);
   await page.setGeolocation({ latitude: config.geoLat, longitude: config.geoLng });
-  logger.info(`Geolocalização definida: ${config.geoLat}, ${config.geoLng}`);
+  logger.info(`Geolocalização: ${config.geoLat}, ${config.geoLng}`);
 
   try {
-    await login(page);
+    let sessionUsed = false;
+
+    if (!config.reauth) {
+      const loaded = await loadCookies(page);
+      if (loaded) {
+        sessionUsed = await isSessionValid(page);
+        if (!sessionUsed) {
+          logger.info('Sessão inválida — iniciando login completo');
+          deleteSession();
+          const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
+          await sendTelegram(
+            `${prefix}🔄 Sessão expirada — fazendo novo login.\n` +
+            `Aguarde a notificação push no <b>Microsoft Authenticator</b>.`
+          );
+        }
+      }
+    } else {
+      logger.info('REAUTH=true — forçando novo login');
+      deleteSession();
+    }
+
+    if (!sessionUsed) {
+      // Browser precisa estar visível para o usuário aprovar o push
+      if (!config.mfaSecret) {
+        logger.info('Sem TOTP configurado — login requer aprovação manual do push');
+        logger.info('ATENÇÃO: se em modo headless, o usuário precisa aprovar no celular');
+      }
+      await login(page);
+      await saveCookies(page);
+    }
 
     if (config.dryRun) {
-      logger.info('🧪 DRY RUN — login OK, navegando para página de ponto sem clicar...');
+      logger.info('🧪 DRY RUN — navegando para ponto sem clicar...');
       await page.goto(config.pontoUrl, { waitUntil: 'networkidle2', timeout: config.timeout });
       await sleep(5000);
       await debugScreenshot(page, '08-ponto-page-dryrun');
       logger.info(`URL do ponto: ${page.url()}`);
 
-      const frames = page.frames();
-      logger.info(`Frames encontrados: ${frames.length}`);
-      for (const frame of frames) {
-        if (frame !== page.mainFrame()) {
-          logger.info(`  Frame: ${frame.url()}`);
-        }
-      }
-
       if (config.debug) {
-        // Inspeciona botões na página principal
         const buttons = await page.evaluate(() => {
-          const btns = document.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"]');
+          const btns = document.querySelectorAll('button, [role="button"], a, input[type="button"]');
           return [...btns].map((el) => ({
             tag: el.tagName,
             id: el.id || '',
@@ -671,26 +748,25 @@ async function executar() {
             text: el.textContent.trim().substring(0, 80),
             visible: el.offsetParent !== null,
             ariaLabel: el.getAttribute('aria-label') || '',
-            type: el.getAttribute('type') || '',
           }));
         });
-        logger.info('Botões/links na página:');
-        buttons.forEach((b) => logger.info(`  [${b.visible ? 'VISÍVEL' : 'oculto'}] <${b.tag}> id="${b.id}" class="${b.class}" text="${b.text}" aria="${b.ariaLabel}"`));
+        logger.info('Botões na página:');
+        buttons.forEach((b) => logger.info(`  [${b.visible ? 'VISÍVEL' : 'oculto'}] <${b.tag}> id="${b.id}" text="${b.text}"`));
 
         const html = await page.evaluate(() => document.body.innerHTML.substring(0, 8000));
-        logger.info(`\nHTML da página (8000 chars):\n${html}`);
+        logger.info(`HTML:\n${html}`);
       }
 
-      const prefixDryRun = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
-      await sendTelegram(`${prefixDryRun}🧪 <b>DRY RUN</b> — Login + navegação OK. Botão de ponto <b>não clicado</b>.`);
-      logger.info('=== DRY RUN concluído com sucesso ===');
+      const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
+      await sendTelegram(`${prefix}🧪 <b>DRY RUN</b> — Login OK. Botão de ponto <b>não clicado</b>.`);
+      logger.info('=== DRY RUN concluído ===');
     } else {
       const pontoOk = await registrarPonto(page);
       if (pontoOk) {
         await notifySuccess();
         logger.info('=== Automação concluída com sucesso ===');
       } else {
-        throw new Error('Registro de ponto falhou — sem confirmação da API');
+        throw new Error('Registro de ponto falhou — sem confirmação');
       }
     }
   } finally {
@@ -698,13 +774,13 @@ async function executar() {
       await browser.close();
       logger.info('Browser fechado');
     } else {
-      logger.info('Modo debug: browser permanece aberto para inspeção');
+      logger.info('Modo debug: browser permanece aberto');
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Main — retry automático (até 3 tentativas, intervalo de 30s)
+// Main — retry automático
 // ---------------------------------------------------------------------------
 
 const MAX_RETRIES = 3;
@@ -723,34 +799,29 @@ async function main() {
   const horaBrasilia = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', timeZoneName: 'short' });
   logger.info(`Hora atual (Brasília): ${horaBrasilia}`);
 
-  logger.info('--- Configuração carregada ---');
-  logger.info(`SISTEMA_PONTO:       ${config.sistemaPonto || '(vazio)'}`);
-  logger.info(`AHGORA_USER:         ${config.user || '(não definido)'}`);
-  logger.info(`AHGORA_PASS:         ${mask(config.password)}`);
-  logger.info(`AHGORA_MFA_SECRET:   ${mask(config.mfaSecret)}`);
-  logger.info(`AHGORA_LOGIN_URL:    ${config.loginUrl || '(não definido)'}`);
-  logger.info(`AHGORA_PONTO_URL:    ${config.pontoUrl || '(não definido)'}`);
-  logger.info(`TELEGRAM_BOT_TOKEN:  ${mask(config.telegramToken)}`);
-  logger.info(`TELEGRAM_CHAT_ID:    ${config.telegramChatId || '(não definido)'}`);
-  logger.info(`GH_GIST_TOKEN:       ${mask(config.gistToken)}`);
-  logger.info(`GIST_ID:             ${config.gistId || '(não definido)'}`);
-  logger.info(`GEO_LAT:             ${config.geoLat}`);
-  logger.info(`GEO_LNG:             ${config.geoLng}`);
-  logger.info(`HEADLESS:            ${config.headless}`);
-  logger.info(`DEBUG:               ${config.debug}`);
-  logger.info(`DRY_RUN:             ${config.dryRun}`);
-  logger.info(`PUPPETEER_PATH:      ${process.env.PUPPETEER_EXECUTABLE_PATH || '(bundled)'}`);
-  logger.info('-----------------------------');
+  logger.info('--- Configuração ---');
+  logger.info(`SISTEMA_PONTO:    ${config.sistemaPonto || '(vazio)'}`);
+  logger.info(`AHGORA_USER:      ${config.user || '(não definido)'}`);
+  logger.info(`AHGORA_PASS:      ${mask(config.password)}`);
+  logger.info(`AHGORA_MFA_SECRET:${mask(config.mfaSecret)}`);
+  logger.info(`AHGORA_LOGIN_URL: ${config.loginUrl || '(não definido)'}`);
+  logger.info(`AHGORA_PONTO_URL: ${config.pontoUrl || '(não definido)'}`);
+  logger.info(`SESSION_FILE:     ${fs.existsSync(SESSION_FILE) ? 'existe' : 'não existe'}`);
+  logger.info(`REAUTH:           ${config.reauth}`);
+  logger.info(`HEADLESS:         ${config.headless}`);
+  logger.info(`DEBUG:            ${config.debug}`);
+  logger.info(`DRY_RUN:          ${config.dryRun}`);
+  logger.info('--------------------');
 
   await runMonthlyLogCleanup();
 
   if (!config.user || !config.password) {
-    logger.error('AHGORA_USER e AHGORA_PASS devem estar definidos no arquivo .env');
+    logger.error('AHGORA_USER e AHGORA_PASS devem estar definidos no .env');
     process.exit(1);
   }
 
   if (!config.loginUrl || !config.pontoUrl) {
-    logger.error('AHGORA_LOGIN_URL e AHGORA_PONTO_URL devem estar definidos no arquivo .env');
+    logger.error('AHGORA_LOGIN_URL e AHGORA_PONTO_URL devem estar definidos no .env');
     process.exit(1);
   }
 
@@ -759,9 +830,9 @@ async function main() {
   if (todayDisabled) {
     const today = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
     const batida = getBatidaAtual();
-    logger.info(`Ponto desativado para hoje (${today}) — pulando batida ${batida}`);
-    const prefixDisabled = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
-    await sendTelegram(`${prefixDisabled}⏸️ Ponto <b>desativado</b> para hoje (${today}) — execução pulada ${batida}`);
+    logger.info(`Ponto desativado para hoje (${today}) — pulando ${batida}`);
+    const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
+    await sendTelegram(`${prefix}⏸️ Ponto <b>desativado</b> para hoje (${today}) — pulado ${batida}`);
     return;
   }
 

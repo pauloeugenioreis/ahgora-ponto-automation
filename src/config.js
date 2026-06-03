@@ -22,6 +22,7 @@ module.exports = {
   headless: process.env.HEADLESS !== 'false',
   debug: process.env.DEBUG === 'true',
   dryRun: process.env.DRY_RUN === 'true',
+  reauth: process.env.REAUTH === 'true',
   slowMo: process.env.DEBUG === 'true' ? 80 : 0,
   timeout: 60_000,
 };
