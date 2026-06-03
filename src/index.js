@@ -154,46 +154,77 @@ async function handleMFA(page) {
 }
 
 async function handleTOTP(page) {
-  logger.info('Tentando MFA via TOTP...');
+  logger.info('Fluxo TOTP iniciado...');
+  await sleep(2000);
+  await debugScreenshot(page, '05-mfa-screen');
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const codeField = await page.$('#idTxtBx_SAOTCC_OTC');
-    if (codeField) {
-      const visible = await page.evaluate((el) => el.offsetParent !== null, codeField);
-      if (visible) break;
-    }
+  // Passo 1: se estiver na tela de escolha de método, clicar em "Usar um código de verificação"
+  const clicouCodigo = await page.evaluate(() => {
+    const textos = [
+      'usar um código de verificação',
+      'use a verification code',
+      'usar código de verificação',
+    ];
+    // Tenta pela estrutura da Microsoft Entra (data-value="PhoneAppOTP")
+    const phoneOTP = document.querySelector('div[data-value="PhoneAppOTP"], li[data-value="PhoneAppOTP"]');
+    if (phoneOTP && phoneOTP.offsetParent !== null) { phoneOTP.click(); return 'PhoneAppOTP'; }
 
-    const anotherWay = await page.$('#signInAnotherWay');
-    if (anotherWay) {
-      const visible = await page.evaluate((el) => el.offsetParent !== null, anotherWay);
-      if (visible) { await page.evaluate((el) => el.click(), anotherWay); await sleep(3000); continue; }
+    // Tenta por texto visível
+    const els = document.querySelectorAll('div, li, a, button, span');
+    for (const el of els) {
+      const t = el.textContent.trim().toLowerCase();
+      if (textos.some((txt) => t === txt || t.startsWith(txt)) && el.offsetParent !== null) {
+        el.click();
+        return el.textContent.trim();
+      }
     }
+    return null;
+  });
 
-    const phoneOTP = await page.$('div[data-value="PhoneAppOTP"]');
-    if (phoneOTP) {
-      const visible = await page.evaluate((el) => el.offsetParent !== null, phoneOTP);
-      if (visible) { await page.evaluate((el) => el.click(), phoneOTP); await sleep(3000); continue; }
-    }
+  if (clicouCodigo) {
+    logger.info(`"Usar um código de verificação" clicado: ${clicouCodigo}`);
     await sleep(2000);
+    await debugScreenshot(page, '05-mfa-apos-codigo');
   }
 
+  // Passo 2: se tiver link "Não consigo usar o Authenticator"
+  const anotherWay = await page.$('#signInAnotherWay');
+  if (anotherWay && await page.evaluate((e) => e.offsetParent !== null, anotherWay)) {
+    await page.evaluate((e) => e.click(), anotherWay);
+    logger.info('"Não consigo usar o Authenticator" clicado');
+    await sleep(2000);
+
+    // Clica novamente em PhoneAppOTP após a navegação
+    const phoneOTPAfter = await page.$('div[data-value="PhoneAppOTP"]');
+    if (phoneOTPAfter && await page.evaluate((e) => e.offsetParent !== null, phoneOTPAfter)) {
+      await page.evaluate((e) => e.click(), phoneOTPAfter);
+      await sleep(2000);
+    }
+  }
+
+  await debugScreenshot(page, '05-mfa-campo');
+
+  // Passo 3: aguarda o campo de código aparecer
   const mfaSelectors = [
     '#idTxtBx_SAOTCC_OTC', 'input[name="otc"]',
-    'input[aria-label*="code"]', 'input[aria-label*="código"]',
-    'input[placeholder*="Code"]', 'input[type="tel"]',
+    'input[aria-label*="code" i]', 'input[aria-label*="código" i]',
+    'input[placeholder*="Code" i]', 'input[type="tel"]',
   ];
 
   let mfaField = null;
-  for (const sel of mfaSelectors) {
-    try {
-      const el = await page.$(sel);
-      if (el && await page.evaluate((e) => e.offsetParent !== null, el)) { mfaField = el; break; }
-    } catch { /* ignora */ }
+  for (let wait = 0; wait < 3 && !mfaField; wait++) {
+    for (const sel of mfaSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (el && await page.evaluate((e) => e.offsetParent !== null, el)) { mfaField = el; break; }
+      } catch { /* ignora */ }
+    }
+    if (!mfaField) await sleep(2000);
   }
 
   if (!mfaField) {
-    logger.warn('Campo TOTP não encontrado — tentando push');
-    await handlePushMFA(page);
+    logger.warn('Campo TOTP não encontrado');
+    await debugScreenshot(page, '05-mfa-campo-nao-encontrado');
     return;
   }
 
@@ -201,13 +232,15 @@ async function handleTOTP(page) {
   logger.info(`TOTP gerado: ${token}`);
   await mfaField.click();
   await mfaField.type(token, { delay: 50 });
+  await debugScreenshot(page, '05-mfa-preenchido');
 
+  // Passo 4: submeter
   for (const sel of ['#idSubmit_SAOTCC_Continue', 'input[type="submit"]', '#idSIButton9', 'button[type="submit"]']) {
     try {
       const btn = await page.$(sel);
       if (btn && await page.evaluate((e) => e.offsetParent !== null, btn)) {
         await page.evaluate((e) => e.click(), btn);
-        logger.info(`Verificar clicado (${sel})`);
+        logger.info(`Submit MFA clicado (${sel})`);
         break;
       }
     } catch { /* ignora */ }
@@ -236,15 +269,38 @@ async function handlePushMFA(page) {
 
 async function handleStaySignedIn(page) {
   await sleep(2000);
+  await debugScreenshot(page, '06-stay-signed');
+
+  // Tenta pelos IDs padrão da Microsoft
   for (const sel of ['#idSIButton9', '#idBtn_Back']) {
     const btn = await page.$(sel);
     if (btn && await page.evaluate((e) => e.offsetParent !== null, btn)) {
       const text = await page.evaluate((e) => e.value || e.textContent || '', btn);
-      logger.info(`"Permanecer conectado?" → clicando "${text.trim()}"`);
+      logger.info(`"Continuar conectado?" → clicando "${text.trim()}" (${sel})`);
       await page.evaluate((e) => e.click(), btn);
       await sleep(5000);
       return;
     }
+  }
+
+  // Tenta pelo texto "Sim" / "Yes" (tela customizada da empresa — AIR/R)
+  const clicouSim = await page.evaluate(() => {
+    const els = document.querySelectorAll('button, input[type="submit"], a');
+    for (const el of els) {
+      const t = el.textContent.trim().toLowerCase();
+      if ((t === 'sim' || t === 'yes') && el.offsetParent !== null) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  });
+
+  if (clicouSim) {
+    logger.info('"Continuar conectado?" → clicou Sim');
+    await sleep(5000);
+  } else {
+    logger.info('"Continuar conectado?" não detectada');
   }
 }
 
@@ -398,6 +454,51 @@ async function clicarSSO(page) {
 
 async function verificarConfirmacao(page, apiResponsePromise) {
   logger.info('Verificando confirmação do ponto...');
+  await debugScreenshot(page, '07-apos-sso');
+
+  // Ahgora volta para ?flow=sso e mostra modal "Confirme seu registro de ponto!"
+  // com botão "REGISTRAR PONTO" — precisa clicar para confirmar
+  logger.info('Aguardando modal de confirmação do Ahgora...');
+  await sleep(3000);
+
+  const clicouRegistrar = await page.evaluate(() => {
+    const textos = ['registrar ponto', 'register punch', 'confirmar', 'confirm'];
+    const els = document.querySelectorAll('button, [role="button"], a');
+    for (const el of els) {
+      const t = el.textContent.trim().toLowerCase().replace(/\s+/g, ' ');
+      if (textos.some((txt) => t.includes(txt)) && el.offsetParent !== null) {
+        el.click();
+        return el.textContent.trim();
+      }
+    }
+    return null;
+  });
+
+  if (clicouRegistrar) {
+    logger.info(`Modal confirmação: clicou "${clicouRegistrar}"`);
+    await sleep(3000);
+    await debugScreenshot(page, '08-apos-registrar');
+  } else {
+    logger.info('Modal "REGISTRAR PONTO" não encontrado ainda — aguardando...');
+    // Aguarda mais um pouco e tenta novamente
+    await sleep(3000);
+    const clicouRegistrar2 = await page.evaluate(() => {
+      const els = document.querySelectorAll('button, [role="button"]');
+      for (const el of els) {
+        const t = el.textContent.trim().toLowerCase().replace(/\s+/g, ' ');
+        if ((t.includes('registrar ponto') || t.includes('register punch')) && el.offsetParent !== null) {
+          el.click();
+          return el.textContent.trim();
+        }
+      }
+      return null;
+    });
+    if (clicouRegistrar2) {
+      logger.info(`Modal confirmação (2ª tentativa): clicou "${clicouRegistrar2}"`);
+      await sleep(3000);
+      await debugScreenshot(page, '08-apos-registrar-2');
+    }
+  }
 
   // Verifica resposta da API
   const apiResponse = await apiResponsePromise;
