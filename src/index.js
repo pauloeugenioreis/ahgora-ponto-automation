@@ -88,17 +88,25 @@ async function handleMicrosoftSSO(page) {
   await sleep(2000);
   await debugScreenshot(page, '03-ms-login');
 
-  // E-mail (Microsoft pode pedir novamente)
-  const emailField = await page.$('input[type="email"], input[name="loginfmt"], #i0116');
-  if (emailField) {
-    const visible = await page.evaluate((el) => el.offsetParent !== null, emailField);
-    if (visible) {
-      logger.info('Microsoft pediu e-mail, preenchendo...');
-      await emailField.click({ clickCount: 3 });
-      await emailField.type(config.user, { delay: 30 });
-      const nextBtn = await page.$('input[type="submit"], #idSIButton9');
-      if (nextBtn) { await nextBtn.click(); await sleep(2000); }
-    }
+  // E-mail — tenta preencher sem checar offsetParent (página customizada pode falhar no check)
+  for (const sel of ['input[type="email"]', 'input[name="loginfmt"]', '#i0116']) {
+    try {
+      await page.waitForSelector(sel, { timeout: 5000 });
+      const field = await page.$(sel);
+      if (field) {
+        await field.click({ clickCount: 3 });
+        await field.type(config.user, { delay: 30 });
+        logger.info(`E-mail preenchido (${sel}): ${config.user}`);
+        await debugScreenshot(page, '03b-email-preenchido');
+        // Clica Avançar/Next
+        for (const btnSel of ['input[type="submit"]', '#idSIButton9', 'button[type="submit"]']) {
+          const btn = await page.$(btnSel);
+          if (btn) { await btn.click(); logger.info(`Avançar email (${btnSel})`); break; }
+        }
+        await sleep(3000);
+        break;
+      }
+    } catch { /* campo não apareceu nesse seletor */ }
   }
 
   // Senha
@@ -352,28 +360,24 @@ async function registrarPonto(page) {
   await debugScreenshot(page, '03-apos-sso-click');
 
   // ---- Passo 3: SSO Microsoft (se redirecionou) ----
-  const urlAposSso = page.url();
-  logger.info(`URL após clicar SSO: ${urlAposSso}`);
-
-  if (urlAposSso.includes('microsoftonline.com') || urlAposSso.includes('login.microsoft.com')) {
+  // Aguarda o redirect para Microsoft (pode demorar alguns segundos)
+  logger.info('Aguardando redirecionamento para Microsoft SSO...');
+  try {
+    await page.waitForFunction(
+      () => window.location.href.includes('microsoftonline.com') ||
+            window.location.href.includes('login.microsoft.com'),
+      { timeout: 20_000 }
+    );
+    logger.info(`Redirecionado para Microsoft: ${page.url().substring(0, 80)}...`);
     await handleMicrosoftSSO(page);
     await saveCookies(page);
-  } else {
-    // Pode ter usado cookies e autenticado sem redirecionar
-    logger.info('Sem redirecionamento Microsoft — possivelmente autenticado via cookies');
-    try {
-      await page.waitForFunction(
-        () => window.location.href.includes('microsoftonline.com') ||
-              window.location.href.includes('login.microsoft.com') ||
-              window.location.href.includes('ahgora.com.br'),
-        { timeout: 10_000 }
-      );
-      const urlFinal = page.url();
-      if (urlFinal.includes('microsoftonline.com') || urlFinal.includes('login.microsoft.com')) {
-        await handleMicrosoftSSO(page);
-        await saveCookies(page);
-      }
-    } catch { /* já no Ahgora */ }
+  } catch {
+    // Não redirecionou para Microsoft — cookies resolveram ou erro
+    const urlAtual = page.url();
+    logger.info(`Sem redirect Microsoft após 20s — URL: ${urlAtual.substring(0, 80)}`);
+    if (urlAtual.includes('ahgora.com.br')) {
+      logger.info('Permaneceu no Ahgora — autenticado via cookies');
+    }
   }
 
   await sleep(3000);
@@ -385,69 +389,72 @@ async function registrarPonto(page) {
 }
 
 async function encontrarBotaoPonto(page) {
-  // Por texto (PT e EN)
-  const textos = ['registre seu ponto', 'register your punch', 'registrar ponto', 'bater ponto'];
-  const result = await page.evaluate((textos) => {
-    const els = document.querySelectorAll('button, a, [role="button"], span, div');
-    for (const el of els) {
-      const t = el.textContent.trim().toLowerCase();
-      if (textos.some((txt) => t.includes(txt)) && el.offsetParent !== null) {
-        el.click();
-        return true;
-      }
-    }
-    return false;
-  }, textos);
+  const textos = ['registre seu ponto', 'register your punch-in', 'register your punch', 'registrar ponto', 'bater ponto'];
 
-  if (result) return { click: () => {} }; // já clicou via evaluate
-
-  // Por seletores CSS
-  for (const sel of ['button.btn-registrar', '.punch-button', '[class*="register"]', 'button.btn-primary', 'button']) {
+  // Usa elementHandle.click() do Puppeteer para disparar eventos React corretamente
+  const buttons = await page.$$('button');
+  for (const btn of buttons) {
     try {
-      const btn = await page.$(sel);
-      if (btn) {
-        const visible = await page.evaluate((e) => e.offsetParent !== null, btn);
-        const text = await page.evaluate((e) => e.textContent.trim().toLowerCase(), btn);
-        if (visible && textos.some((t) => text.includes(t))) return btn;
+      const text = await btn.evaluate((e) => e.textContent.trim().toLowerCase());
+      const visible = await btn.evaluate((e) => e.offsetParent !== null);
+      if (visible && textos.some((t) => text.includes(t))) {
+        return btn;
       }
     } catch { /* ignora */ }
   }
+
+  // Fallback: qualquer elemento clicável com o texto
+  for (const sel of ['a', '[role="button"]']) {
+    const els = await page.$$(sel);
+    for (const el of els) {
+      try {
+        const text = await el.evaluate((e) => e.textContent.trim().toLowerCase());
+        const visible = await el.evaluate((e) => e.offsetParent !== null);
+        if (visible && textos.some((t) => text.includes(t))) return el;
+      } catch { /* ignora */ }
+    }
+  }
+
   return null;
 }
 
 async function clicarSSO(page) {
-  // Aguarda modal aparecer
-  await sleep(1000);
+  // Aguarda o modal aparecer (input de Matrícula/Registration é sinal que abriu)
+  logger.info('Aguardando modal aparecer...');
+  try {
+    await page.waitForSelector(
+      'input[placeholder="Matrícula"], input[placeholder="Registration"], input[placeholder="matricula"]',
+      { visible: true, timeout: 10_000 }
+    );
+    logger.info('Modal detectado via input de matrícula');
+  } catch {
+    // Modal pode ter estrutura diferente — aguarda um tempo fixo
+    logger.info('Input de matrícula não encontrado — aguardando 3s');
+    await sleep(3000);
+  }
 
-  const result = await page.evaluate(() => {
-    const els = document.querySelectorAll('a, button, [role="button"], span');
+  await debugScreenshot(page, '02b-modal-aberto');
+
+  const textos = ['acessar via sso', 'access with sso', 'access via sso', 'entrar via sso'];
+
+  // Usa elementHandle.click() para disparar eventos React corretamente
+  for (const sel of ['a', 'button', 'span', '[role="button"]']) {
+    const els = await page.$$(sel);
     for (const el of els) {
-      const t = el.textContent.trim().toLowerCase();
-      if (
-        (t.includes('sso') || t.includes('acessar via sso') || t.includes('access with sso') ||
-         t.includes('access via sso') || t.includes('entrar via sso')) &&
-        el.offsetParent !== null
-      ) {
-        el.click();
-        return el.textContent.trim();
-      }
-    }
-    return null;
-  });
-
-  if (result) {
-    logger.info(`SSO clicado via evaluate: "${result}"`);
-    return true;
-  }
-
-  // Fallback por href
-  const links = await page.$$('a[href*="sso"], a[href*="microsoft"], a[href*="oauth"]');
-  for (const link of links) {
-    if (await page.evaluate((e) => e.offsetParent !== null, link)) {
-      await link.click();
-      return true;
+      try {
+        const text = await el.evaluate((e) => e.textContent.trim().toLowerCase());
+        if (textos.some((t) => text.includes(t))) {
+          await el.click();
+          logger.info(`SSO clicado (${sel}): "${text}"`);
+          return true;
+        }
+      } catch { /* ignora */ }
     }
   }
+
+  // Log do HTML para diagnóstico
+  const modalHtml = await page.evaluate(() => document.body.innerHTML.substring(0, 3000));
+  logger.info(`HTML do modal:\n${modalHtml}`);
 
   return false;
 }
@@ -474,13 +481,20 @@ async function verificarConfirmacao(page, apiResponsePromise) {
     return null;
   });
 
+  if (config.dryRun) {
+    logger.info('🧪 DRY RUN — modal de confirmação visível, botão "REGISTRAR PONTO" NÃO clicado');
+    await debugScreenshot(page, '08-dryrun-confirmacao');
+    const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
+    await sendTelegram(`${prefix}🧪 <b>DRY RUN</b> — fluxo completo OK até confirmação. Ponto <b>não registrado</b>.`);
+    return true;
+  }
+
   if (clicouRegistrar) {
     logger.info(`Modal confirmação: clicou "${clicouRegistrar}"`);
     await sleep(3000);
     await debugScreenshot(page, '08-apos-registrar');
   } else {
     logger.info('Modal "REGISTRAR PONTO" não encontrado ainda — aguardando...');
-    // Aguarda mais um pouco e tenta novamente
     await sleep(3000);
     const clicouRegistrar2 = await page.evaluate(() => {
       const els = document.querySelectorAll('button, [role="button"]');
@@ -572,6 +586,7 @@ async function executar() {
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
       '--window-size=1366,768',
+      '--lang=pt-BR',
       ...(process.env.CI ? [] : ['--remote-debugging-port=9222']),
     ],
     defaultViewport: { width: 1366, height: 768 },
@@ -581,6 +596,7 @@ async function executar() {
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   );
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9' });
 
   // Geolocalização para o Ahgora aceitar a batida
   const context = browser.defaultBrowserContext();
@@ -597,28 +613,14 @@ async function executar() {
       deleteSession();
     }
 
-    if (config.dryRun) {
-      logger.info('🧪 DRY RUN — navegando sem registrar...');
-      await page.goto(config.pontoUrl, { waitUntil: 'networkidle2', timeout: config.timeout });
-      await sleep(3000);
-      await debugScreenshot(page, 'dryrun-ponto');
-      logger.info(`URL: ${page.url()}`);
-
-      if (config.debug) {
-        const html = await page.evaluate(() => document.body.innerHTML.substring(0, 8000));
-        logger.info(`HTML:\n${html}`);
-      }
-
-      const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
-      await sendTelegram(`${prefix}🧪 <b>DRY RUN</b> — navegação OK. Ponto <b>não registrado</b>.`);
-    } else {
-      const ok = await registrarPonto(page);
-      if (ok) {
-        await notifySuccess();
-        logger.info('=== Ponto registrado com sucesso ===');
-      } else {
-        throw new Error('Registro não confirmado');
-      }
+    // DRY_RUN e execução normal usam o mesmo fluxo —
+    // a diferença está em verificarConfirmacao() que para antes do clique final
+    const ok = await registrarPonto(page);
+    if (ok && !config.dryRun) {
+      await notifySuccess();
+      logger.info('=== Ponto registrado com sucesso ===');
+    } else if (!ok) {
+      throw new Error('Registro não confirmado');
     }
   } finally {
     if (!config.debug) {
