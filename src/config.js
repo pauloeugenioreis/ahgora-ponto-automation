@@ -3,11 +3,11 @@ require('dotenv').config();
 module.exports = {
   sistemaPonto: process.env.SISTEMA_PONTO || '',
 
+  // Credenciais Microsoft (usadas no SSO)
   user: process.env.AHGORA_USER,
   password: process.env.AHGORA_PASS,
   mfaSecret: process.env.AHGORA_MFA_SECRET,
 
-  loginUrl: process.env.AHGORA_LOGIN_URL,
   pontoUrl: process.env.AHGORA_PONTO_URL,
 
   telegramToken: process.env.TELEGRAM_BOT_TOKEN,
