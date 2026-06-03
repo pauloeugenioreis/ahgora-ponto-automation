@@ -1,36 +1,28 @@
-const https = require('https');
+const { execFile } = require('child_process');
 const config = require('./config');
 const logger = require('./logger');
 const { sendTelegram } = require('./notify');
 const gist = require('./gist-storage');
 
+function curlGet(url) {
+  return new Promise((resolve) => {
+    execFile('curl', ['-s', url, '--max-time', '10'], (err, stdout) => {
+      if (err) return resolve(null);
+      try { resolve(JSON.parse(stdout)); } catch { resolve(null); }
+    });
+  });
+}
+
 async function getUpdates() {
   const url = `https://api.telegram.org/bot${config.telegramToken}/getUpdates?timeout=0`;
-
-  return new Promise((resolve) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (json.ok) resolve(json.result || []);
-          else resolve([]);
-        } catch {
-          resolve([]);
-        }
-      });
-    }).on('error', () => resolve([]));
-  });
+  const json = await curlGet(url);
+  return (json && json.ok) ? (json.result || []) : [];
 }
 
 async function confirmUpdates(updateId) {
   const url = `https://api.telegram.org/bot${config.telegramToken}/getUpdates?offset=${updateId + 1}&timeout=0`;
   return new Promise((resolve) => {
-    https.get(url, (res) => {
-      res.on('data', () => {});
-      res.on('end', () => resolve());
-    }).on('error', () => resolve());
+    execFile('curl', ['-s', url, '--max-time', '10'], () => resolve());
   });
 }
 

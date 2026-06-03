@@ -1,4 +1,4 @@
-const https = require('https');
+const { execFile } = require('child_process');
 const config = require('./config');
 const logger = require('./logger');
 
@@ -16,32 +16,28 @@ async function sendTelegram(message) {
   });
 
   return new Promise((resolve) => {
-    const req = https.request(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 200) {
+    execFile('curl', [
+      '-s', '-X', 'POST', url,
+      '-H', 'Content-Type: application/json',
+      '-d', body,
+      '--max-time', '15',
+    ], (err, stdout) => {
+      if (err) {
+        logger.warn(`Falha ao enviar Telegram: ${err.message}`);
+        return resolve();
+      }
+      try {
+        const res = JSON.parse(stdout);
+        if (res.ok) {
           logger.info('Notificação Telegram enviada com sucesso');
         } else {
-          logger.warn(`Telegram respondeu com status ${res.statusCode}: ${data}`);
+          logger.warn(`Telegram erro: ${stdout.substring(0, 200)}`);
         }
-        resolve(data);
-      });
-    });
-
-    req.on('error', (err) => {
-      logger.warn(`Falha ao enviar Telegram: ${err.message}`);
+      } catch {
+        logger.warn(`Telegram resposta inválida: ${stdout.substring(0, 100)}`);
+      }
       resolve();
     });
-
-    req.write(body);
-    req.end();
   });
 }
 
