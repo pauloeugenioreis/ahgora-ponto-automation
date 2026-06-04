@@ -4,3 +4,4 @@ logs/*.log
 logs/debug-*.png
 logs/.last-cleanup
 session/
+logs/mfa-qr.html
