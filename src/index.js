@@ -690,7 +690,7 @@ async function main() {
       logger.error(`Tentativa ${attempt}/${MAX_RETRIES} falhou: ${err.message}`);
       if (attempt < MAX_RETRIES) {
         const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
-        await sendTelegram(`${prefix}⚠️ Tentativa ${attempt}/${MAX_RETRIES}: <code>${err.message}</code>\n🔄 Retentando em 30s...`);
+        await sendTelegram(`${prefix}⚠️ Tentativa ${attempt}/${MAX_RETRIES} falhou: <code>${err.message}</code>\n🔄 Retentando em 30s...`);
         await sleep(RETRY_DELAY);
       } else {
         await notifyError(`Falha após ${MAX_RETRIES} tentativas: ${err.message}`);
