@@ -1,0 +1,65 @@
+name: Batida de Ponto Ahgora
+
+on:
+  # schedule desativado — usando cron na VPS (DigitalOcean)
+  # schedule:
+  #   # Horários em UTC (Brasília = UTC-03:00)
+  #   # 10:00 BRT = 13:00 UTC
+  #   # 13:00 BRT = 16:00 UTC
+  #   # 14:00 BRT = 17:00 UTC
+  #   # 19:00 BRT = 22:00 UTC
+  #   - cron: '0 13 * * 1-5'  # 10:00 Brasília (Seg-Sex)
+  #   - cron: '0 16 * * 1-5'  # 13:00 Brasília (Seg-Sex)
+  #   - cron: '0 17 * * 1-5'  # 14:00 Brasília (Seg-Sex)
+  #   - cron: '0 22 * * 1-5'  # 19:00 Brasília (Seg-Sex)
+
+  # Permite executar manualmente pelo GitHub
+  workflow_dispatch:
+
+jobs:
+  bater-ponto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ponto automation
+        env:
+          AHGORA_USER: ${{ vars.AHGORA_USER }}
+          AHGORA_PASS: ${{ vars.AHGORA_PASS }}
+          AHGORA_MFA_SECRET: ${{ vars.AHGORA_MFA_SECRET }}
+          AHGORA_PONTO_URL: ${{ vars.AHGORA_PONTO_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ vars.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN: ${{ vars.GH_GIST_TOKEN }}
+          GIST_ID: ${{ vars.GIST_ID }}
+          GEO_LAT: ${{ vars.GEO_LAT }}
+          GEO_LNG: ${{ vars.GEO_LNG }}
+          DEBUG: ${{ vars.DEBUG }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          HEADLESS: ${{ vars.HEADLESS }}
+          SISTEMA_PONTO: ${{ vars.SISTEMA_PONTO }}
+          CI: 'true'
+        run: node src/index.js
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: logs/debug-*.png
+          retention-days: 3
+          if-no-files-found: ignore
