@@ -1,6 +1,6 @@
 name: Batida de Ponto Ahgora
 
-on:
+"on":
   # schedule desativado — usando cron na VPS (DigitalOcean)
   # schedule:
   #   # Horários em UTC (Brasília = UTC-03:00)
