@@ -546,7 +546,7 @@ async function verificarConfirmacao(page) {
   const textosSucesso = [
     'ponto registrado', 'batida registrada', 'batida realizada',
     'registrado com sucesso', 'ponto realizado', 'punch registered',
-    'punch recorded', 'clocked in', 'success',
+    'punch recorded', 'clocked in', 'punch-in was successfully', 'success',
   ];
   const checks = page.frames().map((f) =>
     f.waitForFunction(
