@@ -344,6 +344,12 @@ async function registrarPonto(page) {
   const ssoClicado = await clicarSSO(page);
 
   if (!ssoClicado) {
+    const urlAtual = page.url();
+    if (urlAtual.includes('ahgora.com.br')) {
+      logger.info('Botão SSO não encontrado, mas página ainda é Ahgora — empresa pré-selecionada, pulando SSO');
+      await debugScreenshot(page, '02-sem-sso-pre-selecionado');
+      return await verificarConfirmacao(page);
+    }
     await debugScreenshot(page, '02-sso-nao-encontrado');
     throw new Error('Botão "ACESSAR VIA SSO" não encontrado no modal');
   }
@@ -482,7 +488,7 @@ async function verificarConfirmacao(page) {
   // Busca o botão de confirmação mas NÃO clica ainda (precisamos checar dryRun primeiro).
   // Textos conhecidos: "Clocking in" (EN), "Registrar ponto" (PT), "Confirmar" (PT)
   logger.info('Aguardando modal de confirmação do Ahgora...');
-  const textosBotao = ['clocking in', 'clock in', 'registrar ponto', 'register punch', 'confirmar', 'confirm'];
+  const textosBotao = ['clocking in', 'clock in', 'registrar ponto', 'register punch', 'confirmar', 'confirm', 'register your punch-in', 'registre seu ponto'];
   let botaoHandle = null;
   let botaoTexto = null;
 
