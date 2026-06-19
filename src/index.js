@@ -316,14 +316,90 @@ async function handleStaySignedIn(page) {
 // Fluxo principal — bater ponto no Ahgora
 //
 // Tela 1: página pública com botão "Registre seu ponto"
-// Tela 2: modal com opção "ACESSAR VIA SSO"
-// Após SSO: punch confirmado automaticamente
+// Tela 2: modal com opção "ACESSAR VIA SSO" (fluxo legado) OU confirmação direta
 // ---------------------------------------------------------------------------
 
+async function dismissarModalInformativo(page) {
+  // Escape fecha a maioria dos modais MUI por padrão
+  await page.keyboard.press('Escape');
+  await sleep(500);
+
+  const textos = ['fechar', 'close', 'ok', 'entendido', 'got it'];
+  const clicou = await page.evaluate((textos) => {
+    const allBtns = Array.from(document.querySelectorAll('button'));
+
+    // 1ª tentativa: botão com texto conhecido (Fechar, Close, OK…)
+    for (const btn of allBtns) {
+      const t = (btn.innerText || '').trim().toLowerCase();
+      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+      const rect = btn.getBoundingClientRect();
+      if (rect.width > 0 && (textos.some((txt) => t.includes(txt)) || label.includes('close') || label.includes('fechar'))) {
+        btn.click();
+        return btn.innerText.trim() || label || 'close-button';
+      }
+    }
+
+    // 2ª tentativa: MuiIconButton visível sem texto = botão X do modal
+    for (const btn of document.querySelectorAll('button.MuiIconButton-root')) {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width > 0 && (btn.innerText || '').trim() === '') {
+        btn.click();
+        return 'icon-button-X';
+      }
+    }
+
+    // 3ª tentativa: qualquer botão MUI visível sem texto (botão teal do modal)
+    for (const btn of document.querySelectorAll('button.MuiButton-root')) {
+      const rect = btn.getBoundingClientRect();
+      const t = (btn.innerText || '').trim();
+      if (rect.width > 0 && t === '') {
+        btn.click();
+        return 'empty-button';
+      }
+    }
+
+    return null;
+  }, textos);
+
+  if (clicou) {
+    logger.info(`Modal informativo dispensado: "${clicou}"`);
+    await sleep(1000);
+  }
+}
+
 async function registrarPonto(page) {
+  // Listeners configurados antes de qualquer clique para capturar o POST da batida
+  const pontoRequest = { url: null, headers: null, body: null };
+  const pontoResponse = { status: null, body: null };
+
+  page.on('request', (req) => {
+    if (req.url().includes('ahgora.com.br') && req.method() === 'POST') {
+      pontoRequest.url = req.url();
+      pontoRequest.headers = req.headers();
+      pontoRequest.body = req.postData();
+      logger.info(`[API-REQ] POST ${req.url()}`);
+      logger.info(`[API-REQ] Headers: ${JSON.stringify(req.headers())}`);
+      logger.info(`[API-REQ] Body: ${req.postData() || '(vazio)'}`);
+    }
+  });
+
+  page.on('response', async (res) => {
+    if (res.url().includes('ahgora.com.br') && res.request().method() === 'POST') {
+      pontoResponse.status = res.status();
+      try { pontoResponse.body = await res.text(); } catch { /* ignora */ }
+      logger.info(`[API-RES] HTTP ${res.status()} ${res.url()}`);
+      logger.info(`[API-RES] Body: ${pontoResponse.body || '(vazio)'}`);
+    }
+  });
+
   logger.info('Navegando para a página de ponto Ahgora...');
   await page.goto(config.pontoUrl, { waitUntil: 'networkidle2', timeout: config.timeout });
-  await sleep(3000);
+  await sleep(2000);
+
+  // Fecha modal informativo antes de qualquer interação (ex: rebranding TOTVS)
+  await dismissarModalInformativo(page);
+  await sleep(1000);
+
   await debugScreenshot(page, '01-ponto-page');
   logger.info(`URL: ${page.url()} | Título: ${await page.title()}`);
 
@@ -334,10 +410,29 @@ async function registrarPonto(page) {
     await debugScreenshot(page, '01-botao-nao-encontrado');
     throw new Error('Botão "Registre seu ponto" não encontrado');
   }
+  // Reset antes do clique para ignorar chamadas de inicialização da página
+  pontoRequest.url = null; pontoRequest.body = null;
+  pontoResponse.status = null; pontoResponse.body = null;
+
   await btnPonto.click();
   logger.info('Botão "Registre seu ponto" clicado');
-  await sleep(2000);
-  await debugScreenshot(page, '02-modal');
+  await sleep(3000);
+  await debugScreenshot(page, '02-apos-click');
+
+  // Se a API respondeu após o clique, a batida foi registrada diretamente
+  if (pontoResponse.status !== null) {
+    logger.info(`API respondeu HTTP ${pontoResponse.status} após primeiro clique`);
+    if (pontoResponse.status >= 200 && pontoResponse.status < 300) {
+      if (config.dryRun) {
+        logger.info('DRY RUN — API confirmaria a batida, mas estamos em modo teste');
+        const prefix = config.sistemaPonto ? `${config.sistemaPonto} - ` : '';
+        await sendTelegram(`${prefix}🧪 <b>DRY RUN</b> — fluxo OK até confirmação da API. Ponto <b>não registrado</b>.`);
+        return true;
+      }
+      logger.info('Ponto confirmado pela API no primeiro clique!');
+      return true;
+    }
+  }
 
   // ---- Passo 2: modal — clicar em "ACESSAR VIA SSO" ----
   logger.info('Procurando opção SSO no modal...');
@@ -348,7 +443,7 @@ async function registrarPonto(page) {
     if (urlAtual.includes('ahgora.com.br')) {
       logger.info('Botão SSO não encontrado, mas página ainda é Ahgora — empresa pré-selecionada, pulando SSO');
       await debugScreenshot(page, '02-sem-sso-pre-selecionado');
-      return await verificarConfirmacao(page);
+      return await verificarConfirmacao(page, pontoRequest, pontoResponse);
     }
     await debugScreenshot(page, '02-sso-nao-encontrado');
     throw new Error('Botão "ACESSAR VIA SSO" não encontrado no modal');
@@ -383,7 +478,7 @@ async function registrarPonto(page) {
   logger.info(`URL após autenticação: ${page.url()}`);
 
   // ---- Passo 4: verificar confirmação do ponto ----
-  return await verificarConfirmacao(page);
+  return await verificarConfirmacao(page, pontoRequest, pontoResponse);
 }
 
 async function encontrarBotaoPonto(page) {
@@ -457,33 +552,9 @@ async function clicarSSO(page) {
   return false;
 }
 
-async function verificarConfirmacao(page) {
+async function verificarConfirmacao(page, pontoRequest = {}, pontoResponse = {}) {
   logger.info('Verificando confirmação do ponto...');
   await debugScreenshot(page, '07-apos-sso');
-
-  // Intercepta requests ANTES de clicar — loga URL, headers e body do POST de registro
-  const pontoRequest = { url: null, headers: null, body: null };
-  const pontoResponse = { status: null, body: null };
-
-  page.on('request', (req) => {
-    if (req.url().includes('ahgora.com.br') && req.method() === 'POST') {
-      pontoRequest.url = req.url();
-      pontoRequest.headers = req.headers();
-      pontoRequest.body = req.postData();
-      logger.info(`[API-REQ] POST ${req.url()}`);
-      logger.info(`[API-REQ] Headers: ${JSON.stringify(req.headers())}`);
-      logger.info(`[API-REQ] Body: ${req.postData() || '(vazio)'}`);
-    }
-  });
-
-  page.on('response', async (res) => {
-    if (res.url().includes('ahgora.com.br') && res.request().method() === 'POST') {
-      pontoResponse.status = res.status();
-      try { pontoResponse.body = await res.text(); } catch { /* ignora */ }
-      logger.info(`[API-RES] HTTP ${res.status()} ${res.url()}`);
-      logger.info(`[API-RES] Body: ${pontoResponse.body || '(vazio)'}`);
-    }
-  });
 
   // Busca o botão de confirmação mas NÃO clica ainda (precisamos checar dryRun primeiro).
   // Textos conhecidos: "Clocking in" (EN), "Registrar ponto" (PT), "Confirmar" (PT)
@@ -573,13 +644,6 @@ async function verificarConfirmacao(page) {
   }
 
   await debugScreenshot(page, '09-sem-confirmacao');
-
-  // Se o botao foi clicado e estamos no Ahgora sem login, considera sucesso
-  const finalUrl = page.url();
-  if (botaoHandle && finalUrl.includes('ahgora.com.br') && !finalUrl.includes('login')) {
-    logger.info('Botao clicado e retornou ao Ahgora — assumindo sucesso');
-    return true;
-  }
 
   logger.warn('Confirmacao nao detectada — ponto pode nao ter sido registrado');
   return false;
