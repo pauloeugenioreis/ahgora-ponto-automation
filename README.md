@@ -86,7 +86,7 @@ GEO_LNG=-60.032772
 
 > **MFA_SECRET**: É a chave secreta (base32) do seu autenticador. Para simplificar o fluxo de MFA, configure o método padrão como "código de verificação" em [mysignins.microsoft.com/security-info](https://mysignins.microsoft.com/security-info).
 >
-> Algumas contas corporativas exigem especificamente o **Microsoft Authenticator** e não expõem a chave base32 (nem QR code legível por outro app) ao cadastrar outros autenticadores TOTP. Nesse caso, emule um dispositivo Android (ex: Android Studio AVD ou BlueStacks), instale o Microsoft Authenticator nele, cadastre a conta normalmente e extraia a chave base32 diretamente do app dentro do dispositivo emulado.
+> Algumas contas corporativas exigem especificamente o **Microsoft Authenticator** e não expõem a chave base32 (nem QR code legível por outro app) ao cadastrar outros autenticadores TOTP. Nesse caso, emule um dispositivo Android (ex: [Waydroid](https://waydro.id/) no Linux, ou BlueStacks), instale o Microsoft Authenticator nele e cadastre a conta normalmente. No Waydroid, a chave fica em texto puro na coluna `oath_secret_key` do banco SQLite `PhoneFactor` (`~/.local/share/waydroid/data/data/com.azure.authenticator/databases/PhoneFactor`) — use `./scripts/extract-mfa-secret.sh` para extraí-la automaticamente.
 
 > **Telegram**: Crie um bot com @BotFather e obtenha seu Chat ID com @userinfobot.
 
