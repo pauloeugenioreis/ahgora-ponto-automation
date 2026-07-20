@@ -8,8 +8,8 @@ Automatiza o registro de ponto na plataforma **Ahgora** com login via **Microsof
 - Suporte a MFA/TOTP (código de verificação)
 - Registro automático do ponto
 - **Bot Telegram** — receba notificações e controle o ponto pelo celular
-- **Deploy em VPS** — execução via cron nativo, sem delay
-- **GitHub Actions** — execução manual na nuvem (dispatch)
+- **GitHub Actions + cron-job.org** — execução agendada na nuvem, sem custo de VPS
+- **Deploy em VPS** (alternativa) — execução via cron nativo, sem depender de serviços externos
 - **Modo Dry Run** — testa login/SSO/MFA sem clicar no botão de ponto
 - **Retry automático** — até 3 tentativas com intervalo de 30s em caso de falha
 - Logs em arquivo e console (rotativo, 5MB × 5 arquivos)
@@ -85,6 +85,8 @@ GEO_LNG=-60.032772
 > **PUPPETEER_EXECUTABLE_PATH**: Necessário apenas em servidores Linux (DigitalOcean, Oracle Cloud, etc). Localmente e no GitHub Actions, deixe em branco — o Puppeteer usa o Chromium bundled.
 
 > **MFA_SECRET**: É a chave secreta (base32) do seu autenticador. Para simplificar o fluxo de MFA, configure o método padrão como "código de verificação" em [mysignins.microsoft.com/security-info](https://mysignins.microsoft.com/security-info).
+>
+> Algumas contas corporativas exigem especificamente o **Microsoft Authenticator** e não expõem a chave base32 (nem QR code legível por outro app) ao cadastrar outros autenticadores TOTP. Nesse caso, emule um dispositivo Android (ex: Android Studio AVD ou BlueStacks), instale o Microsoft Authenticator nele, cadastre a conta normalmente e extraia a chave base32 diretamente do app dentro do dispositivo emulado.
 
 > **Telegram**: Crie um bot com @BotFather e obtenha seu Chat ID com @userinfobot.
 
@@ -111,9 +113,53 @@ DRY_RUN=true node src/index.js
 $env:DRY_RUN="true"; node src/index.js
 ```
 
-## Deploy em VPS (DigitalOcean, Oracle Cloud, etc.) — Recomendado
+## GitHub Actions + cron-job.org (execução automática e manual) — Recomendado
 
-Método recomendado de execução — cron nativo, sem delay.
+Permite rodar o ponto automaticamente na nuvem (GitHub), sem precisar manter uma VPS.
+
+### 1. Configuração das variáveis
+
+No repositório, acesse **Settings → Secrets and variables → Actions → Variables** e adicione:
+
+| Variável | Valor |
+|---|---|
+| `AHGORA_USER` | Seu e-mail Microsoft |
+| `AHGORA_PASS` | Sua senha |
+| `AHGORA_MFA_SECRET` | Chave TOTP base32 |
+| `AHGORA_PONTO_URL` | URL da página de ponto |
+| `TELEGRAM_BOT_TOKEN` | Token do bot |
+| `TELEGRAM_CHAT_ID` | Seu Chat ID |
+| `GH_GIST_TOKEN` | Token GitHub (scope: gist) |
+| `GIST_ID` | ID do Gist secreto |
+| `GEO_LAT` | Latitude do escritório (ex: `-3.054679`) |
+| `GEO_LNG` | Longitude do escritório (ex: `-60.032772`) |
+| `SISTEMA_PONTO` | `Ahgora` |
+| `DRY_RUN` | (opcional) `true` para simular sem clicar |
+
+### 2. Execução manual (dispatch)
+
+Na aba **Actions** do GitHub, selecione o workflow "Batida de Ponto Ahgora" e clique em **Run workflow** para executar sob demanda.
+
+### 3. Execução automática (cron-job.org)
+
+O workflow usa apenas `workflow_dispatch` (disparo manual/via API) — o `schedule` nativo do GitHub Actions está desativado (comentado em `.github/workflows/ponto.yml`), pois seus horários podem atrasar bastante em contas gratuitas.
+
+O agendamento automático é feito externamente pelo [cron-job.org](https://console.cron-job.org), que faz um `POST` na API do GitHub para disparar o workflow nos horários desejados:
+
+```
+POST https://api.github.com/repos/<usuario>/<repo>/actions/workflows/ponto.yml/dispatches
+Authorization: Bearer <PAT com scope 'actions:write' ou 'repo'>
+Accept: application/vnd.github+json
+Content-Type: application/json
+
+{ "ref": "master" }
+```
+
+Configure um job no cron-job.org para cada horário desejado (10:00, 13:00, 14:00, 19:00 Brasília), apontando para essa URL com o método e headers acima.
+
+## Deploy em VPS (DigitalOcean, Oracle Cloud, etc.) — Alternativa
+
+Método alternativo ao GitHub Actions + cron-job.org, útil se preferir não depender de serviços externos. Usa cron nativo, sem delay.
 
 1. Crie uma VM com **Ubuntu 24.04 LTS** (mínimo 1GB RAM para Puppeteer)
 2. Instale Node.js + Chromium:
@@ -164,50 +210,6 @@ Método recomendado de execução — cron nativo, sem delay.
 
 > **Dica:** Para alterar o fuso da VM para Brasília: `timedatectl set-timezone America/Sao_Paulo`
 
-
-## GitHub Actions (execução automática e manual)
-
-Permite rodar o ponto automaticamente na nuvem (GitHub) ou manualmente sob demanda.
-
-### 1. Configuração das variáveis
-
-No repositório, acesse **Settings → Secrets and variables → Actions → Variables** e adicione:
-
-| Variável | Valor |
-|---|---|
-| `AHGORA_USER` | Seu e-mail Microsoft |
-| `AHGORA_PASS` | Sua senha |
-| `AHGORA_MFA_SECRET` | Chave TOTP base32 |
-| `AHGORA_PONTO_URL` | URL da página de ponto |
-| `TELEGRAM_BOT_TOKEN` | Token do bot |
-| `TELEGRAM_CHAT_ID` | Seu Chat ID |
-| `GH_GIST_TOKEN` | Token GitHub (scope: gist) |
-| `GIST_ID` | ID do Gist secreto |
-| `GEO_LAT` | Latitude do escritório (ex: `-3.054679`) |
-| `GEO_LNG` | Longitude do escritório (ex: `-60.032772`) |
-| `SISTEMA_PONTO` | `Ahgora` |
-| `DRY_RUN` | (opcional) `true` para simular sem clicar |
-
-### 2. Execução manual (dispatch)
-
-Na aba **Actions** do GitHub, selecione o workflow "Batida de Ponto Ahgora" e clique em **Run workflow** para executar sob demanda.
-
-### 3. Execução automática (schedule)
-
-Para ativar o agendamento automático, descomente o bloco `schedule` no arquivo `.github/workflows/ponto.yml` e ajuste os horários conforme desejado:
-
-```yaml
-on:
-   schedule:
-      - cron: '0 13 * * 1-5'  # 10:00 Brasília (Seg-Sex)
-      - cron: '0 16 * * 1-5'  # 13:00 Brasília (Seg-Sex)
-      - cron: '0 17 * * 1-5'  # 14:00 Brasília (Seg-Sex)
-      - cron: '0 22 * * 1-5'  # 19:00 Brasília (Seg-Sex)
-   workflow_dispatch:
-```
-
-> **Atenção:** O GitHub Actions pode atrasar execuções agendadas em até 60 minutos, especialmente em contas gratuitas. Para máxima confiabilidade, prefira rodar em VPS ou cron local.
-
 ## Estrutura
 
 ```
@@ -233,6 +235,7 @@ on:
 - **Seletores errados?** Execute com `npm run debug` e veja os screenshots em `logs/`
 - **Timeout?** Aumente o valor de `timeout` em `src/config.js` (padrão: 60s)
 - **MFA falha?** Verifique se o `AHGORA_MFA_SECRET` está correto (chave base32)
+- **Não consigo extrair a chave base32 (empresa força Microsoft Authenticator)?** Veja a nota sobre emular Android na seção [Configurar credenciais](#2-configurar-credenciais)
 - **Telegram "chat not found"?** Mande qualquer mensagem para o bot antes de usar
 - **GitHub Actions falha?** Verifique as variáveis e os logs na aba Actions
 - **VPS: Chromium não encontrado?** Rode `which chromium-browser || which chromium` e ajuste `PUPPETEER_EXECUTABLE_PATH` no `.env`

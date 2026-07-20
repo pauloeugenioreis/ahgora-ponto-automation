@@ -1,7 +1,9 @@
 name: Batida de Ponto Ahgora
 
 "on":
-  # schedule desativado — usando cron na VPS (DigitalOcean)
+  # schedule nativo desativado (atraso de até 60min em contas gratuitas) —
+  # agendamento feito externamente via cron-job.org, que dispara este
+  # workflow_dispatch pela API do GitHub nos horários desejados.
   # schedule:
   #   # Horários em UTC (Brasília = UTC-03:00)
   #   # 10:00 BRT = 13:00 UTC
